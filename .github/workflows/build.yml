@@ -164,10 +164,10 @@ jobs:
           # 2. Append PRODUCT_COPY_FILES to device makefile
           cat >> "${VENDOR_DIR}/${DEVICE}.mk" << 'MKEOF'
 
-# KR VoLTE patch: copy AT command script to vendor
-PRODUCT_COPY_FILES += \
-    vendor/google_devices/tegu/write_at_cmd.sh:vendor/bin/write_at_cmd.sh
-MKEOF
+          # KR VoLTE patch: copy AT command script to vendor
+          PRODUCT_COPY_FILES += \
+              vendor/google_devices/tegu/write_at_cmd.sh:vendor/bin/write_at_cmd.sh
+          MKEOF
           echo "Updated ${DEVICE}.mk"
 
           # 3. Add SELinux file context
@@ -177,35 +177,35 @@ MKEOF
 
           # 4. Create SELinux policy
           cat > "${VENDOR_DIR}/sepolicy/vendor/write_at_cmd.te" << 'SEEOF'
-type write_at_cmd, domain;
-type write_at_cmd_exec, exec_type, vendor_file_type, file_type;
-init_daemon_domain(write_at_cmd)
-allow write_at_cmd radio_device:chr_file { rw_file_perms ioctl };
-allow write_at_cmd logd:fd use;
-allow write_at_cmd logd_socket:sock_file write;
-allow shell write_at_cmd_exec:file getattr;
-allow write_at_cmd shell_exec:file execute_no_trans;
-allow write_at_cmd toolbox_exec:file { read getattr execute open };
-get_prop(write_at_cmd, telephony_status_prop)
-allow write_at_cmd vendor_toolbox_exec:file { execute execute_no_trans read open };
-SEEOF
+          type write_at_cmd, domain;
+          type write_at_cmd_exec, exec_type, vendor_file_type, file_type;
+          init_daemon_domain(write_at_cmd)
+          allow write_at_cmd radio_device:chr_file { rw_file_perms ioctl };
+          allow write_at_cmd logd:fd use;
+          allow write_at_cmd logd_socket:sock_file write;
+          allow shell write_at_cmd_exec:file getattr;
+          allow write_at_cmd shell_exec:file execute_no_trans;
+          allow write_at_cmd toolbox_exec:file { read getattr execute open };
+          get_prop(write_at_cmd, telephony_status_prop)
+          allow write_at_cmd vendor_toolbox_exec:file { execute execute_no_trans read open };
+          SEOOF
           echo "Created write_at_cmd.te"
 
           # 5. Add init service to init.pixel.rc
           cat >> "${VENDOR_DIR}/proprietary/vendor/etc/init/init.pixel.rc" << 'INITEOF'
 
-# KR VoLTE patch: run AT commands on boot
-service write_at_cmd /vendor/bin/write_at_cmd.sh
-    class main
-    user system
-    group system
-    oneshot
-    disabled
+          # KR VoLTE patch: run AT commands on boot
+          service write_at_cmd /vendor/bin/write_at_cmd.sh
+              class main
+              user system
+              group system
+              oneshot
+              disabled
 
-on property:sys.boot_completed=1
-    setprop persist.dbg.volte_avail_ovr 1
-    start write_at_cmd
-INITEOF
+          on property:sys.boot_completed=1
+              setprop persist.dbg.volte_avail_ovr 1
+              start write_at_cmd
+          INITEOF
           echo "Updated init.pixel.rc"
 
           echo "=== KR VoLTE patch applied successfully ==="
