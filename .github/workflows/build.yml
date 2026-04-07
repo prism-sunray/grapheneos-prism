@@ -296,17 +296,21 @@ jobs:
             exit 1
           fi
 
+          cat > /tmp/release-notes.md <<EOF
+          Custom GrapheneOS build for Pixel 9a (tegu) with KR VoLTE patch.
+
+          Based on official GrapheneOS release ${TAG}.
+
+          **Patches applied:**
+          - Korean VoLTE (AT command modem config for LGU+ and MVNOs)
+
+          **Important:** These images are signed with custom keys. You must have already flashed the corresponding AVB key to your device.
+          EOF
+
           gh release create "v${TAG}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "GrapheneOS ${TAG} for ${DEVICE} (Pixel 9a)" \
-            --notes "Custom GrapheneOS build for Pixel 9a (tegu) with KR VoLTE patch.
-
-Based on official GrapheneOS release ${TAG}.
-
-**Patches applied:**
-- Korean VoLTE (AT command modem config for LGU+ and MVNOs)
-
-**Important:** These images are signed with custom keys. You must have already flashed the corresponding AVB key to your device." \
+            --notes-file /tmp/release-notes.md \
             ${RELEASE_DIR}/*
 
       - name: Cleanup sensitive data
