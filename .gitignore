@@ -1,0 +1,5 @@
+# Never commit signing keys
+keys/
+
+# Temporary tool download used by scripts/generate-keys.sh
+development/

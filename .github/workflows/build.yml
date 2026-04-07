@@ -1,0 +1,313 @@
+name: Build GrapheneOS for tegu (Pixel 9a)
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: 'Force build a specific tag (e.g. 2026040300). Leave empty to auto-detect.'
+        required: false
+        default: ''
+
+env:
+  DEVICE: tegu
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Check for new GrapheneOS release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ github.event.inputs.force_tag }}" ]; then
+            TAG="${{ github.event.inputs.force_tag }}"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Forced build for tag: $TAG"
+            exit 0
+          fi
+
+          FEED=$(curl -sf https://grapheneos.org/releases.atom)
+
+          LATEST_TAG=$(echo "$FEED" | python3 -c "
+          import sys
+          import xml.etree.ElementTree as ET
+
+          feed = ET.parse(sys.stdin)
+          ns = {'atom': 'http://www.w3.org/2005/Atom'}
+
+          for entry in feed.findall('.//atom:entry', ns):
+              title = entry.find('atom:title', ns).text
+              content = entry.find('atom:content', ns)
+              content_text = ET.tostring(content, encoding='unicode', method='text')
+              if 'Pixel 9a' in content_text or 'tegu' in content_text:
+                  print(title)
+                  break
+          ")
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No release found for tegu/Pixel 9a"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Latest tag for tegu: $LATEST_TAG"
+
+          EXISTING=$(gh release view "v${LATEST_TAG}" --repo "$GITHUB_REPOSITORY" 2>/dev/null && echo "exists" || echo "new")
+
+          if [ "$EXISTING" = "exists" ]; then
+            echo "Already built tag $LATEST_TAG, skipping"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New release found: $LATEST_TAG"
+            echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2400
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup \
+            /usr/lib/jvm /opt/hostedtoolcache
+          sudo apt-get clean
+          sudo docker system prune -af || true
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            repo git gnupg curl openssh-client \
+            zip unzip rsync diffutils \
+            libfreetype6-dev libfontconfig1-dev fonts-dejavu \
+            hostname openssl gperf \
+            lib32gcc-s1 libc6-i386 \
+            python3 python-is-python3 \
+            openjdk-21-jdk-headless \
+            jq expect
+
+          # Node.js 24 LTS for adevtool
+          curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+          sudo npm install -g yarn
+
+          # Ensure sbin dirs are in PATH
+          echo 'export PATH=$PATH:/sbin:/usr/sbin:/usr/local/sbin' >> ~/.bashrc
+
+      - name: Configure git
+        run: |
+          git config --global user.name "GrapheneOS Builder"
+          git config --global user.email "builder@localhost"
+          git config --global color.ui false
+
+      - name: Sync GrapheneOS source tree
+        env:
+          TAG: ${{ needs.check-release.outputs.tag }}
+        run: |
+          mkdir -p ~/grapheneos
+          cd ~/grapheneos
+
+          repo init -u https://github.com/GrapheneOS/platform_manifest.git \
+            -b "refs/tags/${TAG}"
+
+          # Verify the manifest tag
+          mkdir -p ~/.ssh
+          curl -sf https://grapheneos.org/allowed_signers > ~/.ssh/grapheneos_allowed_signers
+          cd .repo/manifests
+          git config gpg.ssh.allowedSignersFile ~/.ssh/grapheneos_allowed_signers
+          git verify-tag "$(git describe)" || echo "Warning: tag verification failed (non-fatal)"
+          cd ../..
+
+          repo sync -j8
+
+      - name: Extract vendor files
+        run: |
+          cd ~/grapheneos
+          yarn --cwd vendor/adevtool/ install
+          adevtool generate-all -d $DEVICE
+
+      - name: Apply KR VoLTE patch
+        if: ${{ hashFiles('patches/write_at_cmd.sh') != '' }}
+        run: |
+          cd ~/grapheneos
+          VENDOR_DIR="vendor/google_devices/${DEVICE}"
+
+          echo "=== Applying Korean VoLTE patch to ${VENDOR_DIR} ==="
+
+          # 1. Copy write_at_cmd.sh into the vendor directory
+          cp "${GITHUB_WORKSPACE}/patches/write_at_cmd.sh" "${VENDOR_DIR}/write_at_cmd.sh"
+          chmod 755 "${VENDOR_DIR}/write_at_cmd.sh"
+          echo "Copied write_at_cmd.sh"
+
+          # 2. Append PRODUCT_COPY_FILES to device makefile
+          cat >> "${VENDOR_DIR}/${DEVICE}.mk" << 'MKEOF'
+
+# KR VoLTE patch: copy AT command script to vendor
+PRODUCT_COPY_FILES += \
+    vendor/google_devices/tegu/write_at_cmd.sh:vendor/bin/write_at_cmd.sh
+MKEOF
+          echo "Updated ${DEVICE}.mk"
+
+          # 3. Add SELinux file context
+          echo '/vendor/bin/write_at_cmd.sh   u:object_r:write_at_cmd_exec:s0' \
+            >> "${VENDOR_DIR}/sepolicy/vendor/file_contexts"
+          echo "Updated file_contexts"
+
+          # 4. Create SELinux policy
+          cat > "${VENDOR_DIR}/sepolicy/vendor/write_at_cmd.te" << 'SEEOF'
+type write_at_cmd, domain;
+type write_at_cmd_exec, exec_type, vendor_file_type, file_type;
+init_daemon_domain(write_at_cmd)
+allow write_at_cmd radio_device:chr_file { rw_file_perms ioctl };
+allow write_at_cmd logd:fd use;
+allow write_at_cmd logd_socket:sock_file write;
+allow shell write_at_cmd_exec:file getattr;
+allow write_at_cmd shell_exec:file execute_no_trans;
+allow write_at_cmd toolbox_exec:file { read getattr execute open };
+get_prop(write_at_cmd, telephony_status_prop)
+allow write_at_cmd vendor_toolbox_exec:file { execute execute_no_trans read open };
+SEEOF
+          echo "Created write_at_cmd.te"
+
+          # 5. Add init service to init.pixel.rc
+          cat >> "${VENDOR_DIR}/proprietary/vendor/etc/init/init.pixel.rc" << 'INITEOF'
+
+# KR VoLTE patch: run AT commands on boot
+service write_at_cmd /vendor/bin/write_at_cmd.sh
+    class main
+    user system
+    group system
+    oneshot
+    disabled
+
+on property:sys.boot_completed=1
+    setprop persist.dbg.volte_avail_ovr 1
+    start write_at_cmd
+INITEOF
+          echo "Updated init.pixel.rc"
+
+          echo "=== KR VoLTE patch applied successfully ==="
+
+      - name: Skip KR VoLTE patch (not configured)
+        if: ${{ hashFiles('patches/write_at_cmd.sh') == '' }}
+        run: |
+          echo "patches/write_at_cmd.sh not found; skipping KR VoLTE patch."
+
+      - name: Apply additional patches
+        run: |
+          cd ~/grapheneos
+          if ls ${GITHUB_WORKSPACE}/patches/*.patch 1>/dev/null 2>&1; then
+            for patch_file in ${GITHUB_WORKSPACE}/patches/*.patch; do
+              echo "Applying local patch: $patch_file"
+              git apply "$patch_file" || echo "Warning: patch failed - $patch_file"
+            done
+          fi
+
+      - name: Build
+        run: |
+          cd ~/grapheneos
+          source build/envsetup.sh
+          lunch ${DEVICE}-cur-user
+
+          rm -rf out
+
+          # tegu is 9th gen: needs vendorbootimage vendorkernelbootimage
+          m vendorbootimage vendorkernelbootimage target-files-package -j$(nproc)
+
+          # otatools needed for generating signed release
+          m otatools-package
+
+      - name: Decrypt signing keys
+        env:
+          SIGNING_KEYS: ${{ secrets.SIGNING_KEYS }}
+          KEYS_PASSWORD: ${{ secrets.KEYS_PASSWORD }}
+        run: |
+          # Layer 1: GPG decrypt the archive (transport encryption for GitHub Secrets)
+          echo "$SIGNING_KEYS" | base64 -d > /tmp/keys.tar.gz.gpg
+          echo "$KEYS_PASSWORD" | gpg --batch --yes --passphrase-fd 0 \
+            --decrypt /tmp/keys.tar.gz.gpg > /tmp/keys.tar.gz
+          rm -f /tmp/keys.tar.gz.gpg
+
+          # Extract scrypt-encrypted key files into source tree
+          mkdir -p ~/grapheneos/keys
+          tar -xzf /tmp/keys.tar.gz -C ~/grapheneos/keys
+          rm -f /tmp/keys.tar.gz
+
+          # Layer 2: Decrypt the actual signing keys (scrypt/AES256 from make_key)
+          # script/decrypt-keys prompts for the passphrase interactively
+          cd ~/grapheneos
+          expect -c "
+            set timeout 60
+            spawn script/decrypt-keys keys/${DEVICE}
+            expect \"Enter passphrase:\" { send \"${KEYS_PASSWORD}\r\" }
+            expect eof
+          " || {
+            # Fallback: try piping directly
+            echo "$KEYS_PASSWORD" | script/decrypt-keys keys/${DEVICE}
+          }
+
+      - name: Sign release
+        env:
+          TAG: ${{ needs.check-release.outputs.tag }}
+        run: |
+          cd ~/grapheneos
+          source build/envsetup.sh
+          lunch ${DEVICE}-cur-user
+
+          script/finalize.sh
+
+          # Keys are already decrypted, generate-release.sh should not prompt
+          script/generate-release.sh $DEVICE "$TAG"
+
+      - name: Upload to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-release.outputs.tag }}
+        run: |
+          cd ~/grapheneos
+          RELEASE_DIR="releases/${TAG}/release-${DEVICE}-${TAG}"
+
+          if [ ! -d "$RELEASE_DIR" ]; then
+            echo "Release directory not found: $RELEASE_DIR"
+            ls -la releases/ || true
+            ls -la "releases/${TAG}/" || true
+            exit 1
+          fi
+
+          gh release create "v${TAG}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "GrapheneOS ${TAG} for ${DEVICE} (Pixel 9a)" \
+            --notes "Custom GrapheneOS build for Pixel 9a (tegu) with KR VoLTE patch.
+
+Based on official GrapheneOS release ${TAG}.
+
+**Patches applied:**
+- Korean VoLTE (AT command modem config for LGU+ and MVNOs)
+
+**Important:** These images are signed with custom keys. You must have already flashed the corresponding AVB key to your device." \
+            ${RELEASE_DIR}/*
+
+      - name: Cleanup sensitive data
+        if: always()
+        run: |
+          rm -rf ~/grapheneos/keys
+          rm -f /tmp/keys.tar.gz /tmp/keys.tar.gz.gpg
